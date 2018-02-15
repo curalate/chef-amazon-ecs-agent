@@ -1,14 +1,60 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-docker run \
-    --name ecs-agent \
-    --restart=always \
-    --volume=/var/run/docker.sock:/var/run/docker.sock \
-    --volume=<%= @log_folder %>:/log \
-    --volume=<%= @data_folder %>:/data \
-    --volume=/sys/fs/cgroup:/sys/fs/cgroup:ro \
-    --volume=/var/run/docker/libcontainerd:/var/lib/libcontainerd:ro \
-    --net=host \
-    --env-file=<%= @env_file %> \
-    amazon/amazon-ecs-agent:<%= @tag %>
+# Launch the amazon-ecs-agent container to register this EC2 instance as part
+# of the ECS cluster defined in /etc/default/ecs-agent. The number of retries
+# and interval between retries both default to 10 but can be override via the
+# ECS_AGENT_MAX_RETRIES and ECS_AGENT_RETRY_INTERVAL variables set in that
+# file. If the agent cannot be started after the configured attempts a metric
+# is recorded in CloudWatch and the instance terminates.
+
+. /etc/default/ecs-agent
+
+ATTEMPT=0
+RETRIES=${ECS_AGENT_MAX_RETRIES:-10}
+INTERVAL=${ECS_AGENT_RETRY_INTERVAL:-10}
+CLOUDWATCH_NAMESPACE="${CLOUDWATCH_NAMESPACE:-Curalate/AutoScaling}"
+
+function start_agent() {
+    docker run \
+        -d \
+        --name ecs-agent \
+        --restart=always \
+        --volume=/var/run/docker.sock:/var/run/docker.sock \
+        --volume=<%= @log_folder %>:/log \
+        --volume=<%= @data_folder %>:/data \
+        --volume=/sys/fs/cgroup:/sys/fs/cgroup:ro \
+        --volume=/var/run/docker/libcontainerd:/var/lib/libcontainerd:ro \
+        --net=host \
+        --env-file=<%= @env_file %> \
+        amazon/amazon-ecs-agent:<%= @tag %>
+
+    return $?
+}
+
+function terminate() {
+    INSTANCE_ID=$(curl -s http://instance-data/latest/meta-data/instance-id)
+
+    aws cloudwatch put-metric-data \
+        --namespace $CLOUDWATCH_NAMESPACE \
+        --metric-name SelfTerminate \
+        --dimensions Application=ecs,Cluster=$ECS_CLUSTER,Reason=AgentLaunchFailure,InstanceID=$INSTANCE_ID \
+        --value 1 \
+        --unit Count
+
+    aws ec2 terminate-instances --instance-ids $INSTANCE_ID
+}
+
+until [ $ATTEMPT -ge $RETRIES ]; do
+    start_agent && break
+    ATTEMPT=$[$ATTEMPT+1]
+
+    echo "Retrying ECS agent container launch [$ATTEMPT/$RETRIES] in $INTERVAL(s)"
+    sleep $INTERVAL
+done
+
+if [ $ATTEMPT -ge $RETRIES ]; then
+    echo "Failed to start ECS agent container after $RETRIES attempts!"
+    terminate
+    exit 1
+fi
