@@ -10,15 +10,18 @@ set -euo pipefail
 
 . /etc/default/ecs-agent
 
+AGENT_CONTAINER_NAME="ecs-agent"
 ATTEMPT=0
 RETRIES=${ECS_AGENT_MAX_RETRIES:-10}
 INTERVAL=${ECS_AGENT_RETRY_INTERVAL:-10}
 CLOUDWATCH_NAMESPACE="${CLOUDWATCH_NAMESPACE:-Curalate/AutoScaling}"
 
 function start_agent() {
+    cleanup
+
     docker run \
         -d \
-        --name ecs-agent \
+        --name $AGENT_CONTAINER_NAME \
         --restart=always \
         --volume=/var/run/docker.sock:/var/run/docker.sock \
         --volume=<%= @log_folder %>:/log \
@@ -30,6 +33,12 @@ function start_agent() {
         amazon/amazon-ecs-agent:<%= @tag %>
 
     return $?
+}
+
+function cleanup() {
+    rm -rf /var/lib/ecs/data/*
+    docker stop $AGENT_CONTAINER_NAME || true
+    docker rm $AGENT_CONTAINER_NAME || true
 }
 
 function terminate() {
